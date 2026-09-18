@@ -21,8 +21,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify Xcode 27
+      - name: Normalize Xcode environment
         run: |
+          echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           xcrun --find clang
