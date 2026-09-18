@@ -32,7 +32,7 @@ jobs:
       - name: Install build tools
         run: |
           brew install xcodegen
-          rustup target add aarch64-apple-ios
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 
       - name: Build Rust FFI
         run: |
