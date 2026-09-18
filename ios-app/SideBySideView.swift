@@ -281,7 +281,32 @@ final class SideBySideManager: ObservableObject {
     private func connectToTarget(ip: String) async throws {
         try Task.checkCancellation()
         setStep(.connect, .waiting)
-        let target = try await onDeviceQueue { try self.performConnect(ip: ip) }
+        let target: ConnectedTarget
+        do {
+            target = try await onDeviceQueue { try self.performConnect(ip: ip) }
+        } catch {
+            // iOS 27 can accept the TCP connection to lockdownd:62078 and then
+            // immediately reset it before DevicePublicKey is returned. In that
+            // state the classic lockdown bootstrap can never reach the Trust
+            // prompt. Fall back to iOS 27 Remote Pairing instead: advertise this
+            // iPhone as a pairable host, let the target approve it from
+            // Settings > Privacy & Security > Developer Mode > Pair with
+            // SideInstaller, then use the resulting RPPairing record to open RSD.
+            let raw = String(describing: error).lowercased()
+            let looksLikeLockdownReset =
+                raw.contains("connection reset") ||
+                raw.contains("os error 54") ||
+                raw.contains("devicepublickey")
+            guard Engine.deviceCanSelfPair, looksLikeLockdownReset else { throw error }
+
+            engine.log("Classic Side by Side pairing was reset by the target. Falling back to iOS 27 Remote Pairing…")
+            engine.log("On the TARGET iPhone: Settings › Privacy & Security › Developer Mode › Pair with SideInstaller. Confirm the PIN shown here.")
+            let remotePairPath = try await PairingController.shared.startAndWait()
+            try Task.checkCancellation()
+            target = try await onDeviceQueue {
+                try self.performConnectWithRemotePairing(ip: ip, pairingFilePath: remotePairPath)
+            }
+        }
         targetSummary = target.summary
         targetUDID = target.udid
         targetName = target.name
@@ -322,6 +347,36 @@ final class SideBySideManager: ObservableObject {
         } else {
             engine.log("Device info:")
             for (key, value) in info { values[key] = value; engine.log("  \(key) = \(value)") }
+        }
+        let name = values["DeviceName"] ?? L("device")
+        let summary = values["ProductVersion"].map { "\(name) · iOS \($0)" } ?? name
+        return ConnectedTarget(summary: summary,
+                               udid: values["UniqueDeviceID"],
+                               name: values["DeviceName"])
+    }
+
+    /// Opens Side by Side from an iOS 27 Remote Pairing record. This is the
+    /// fallback for devices that expose port 62078 but reset the classic
+    /// lockdownd bootstrap before DevicePublicKey/Trust can complete.
+    private func performConnectWithRemotePairing(ip: String, pairingFilePath: String) throws -> ConnectedTarget {
+        let peerRecord = PrivateStore.peerPairRecord(host: ip)
+        let data = try Data(contentsOf: URL(fileURLWithPath: pairingFilePath))
+        guard !data.isEmpty else {
+            throw EngineError.message(L("Remote Pairing produced an empty pairing file."))
+        }
+        try data.write(to: peerRecord, options: .atomic)
+        pairRecordPath = peerRecord.path
+
+        engine.log("Remote Pairing record ready (\(data.count) bytes). Opening the iOS 27 RPPairing tunnel to \(ip)…")
+        try connection.connect(deviceIP: ip, pairingFilePath: peerRecord.path)
+        engine.log("RPPairing tunnel + RSD handshake established with \(ip).")
+        engine.log(try connection.rsdSummary())
+
+        var values: [String: String] = [:]
+        let info = try connection.deviceInfo()
+        for (key, value) in info {
+            values[key] = value
+            engine.log("  \(key) = \(value)")
         }
         let name = values["DeviceName"] ?? L("device")
         let summary = values["ProductVersion"].map { "\(name) · iOS \($0)" } ?? name
